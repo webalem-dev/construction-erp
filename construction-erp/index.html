@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!--
+      Mobile-friendly viewport. The default `width=device-width` is fine,
+      but we also let the user pinch-zoom (no `maximum-scale`) which
+      matches the rest of the modern web and respects accessibility.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- Theme color follows the user's light/dark preference -->
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0f172a" media="(prefers-color-scheme: dark)" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="description" content="Construction ERP — projects, stock, HR, payroll." />
+    <title>Construction ERP</title>
+    <!--
+      Inline anti-flash dark mode script. Runs before React hydrates so
+      the first paint already shows the correct theme — no light flash
+      when the persisted store says dark.
+    -->
+    <script>
+      (function () {
+        try {
+          var raw = localStorage.getItem('theme-store');
+          var theme = 'light';
+          if (raw) {
+            var parsed = JSON.parse(raw);
+            theme = (parsed && parsed.state && parsed.state.theme) || 'light';
+          }
+          if (theme === 'dark') document.documentElement.classList.add('dark');
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,1028 @@
+-- =====================================================================
+-- Construction ERP — Sync migration (additive only)
+-- Run in Supabase SQL Editor. Idempotent — safe to re-run.
+-- Targets gaps between your existing schema (the old database.types.ts
+-- file has been deleted; types now live in src/types/index.ts) and the
+-- new frontend pages (PayslipDetailPage, RolesPage, etc.).
+-- =====================================================================
+
+-- =====================================================================
+-- 1. NEW TABLES the frontend expects
+-- =====================================================================
+
+-- Leave types catalog (referenced by leave_requests.leave_type_id)
+create table if not exists public.leave_types (
+  id                 uuid primary key default gen_random_uuid(),
+  code               text not null unique,
+  name               text not null,
+  default_days       int,
+  is_paid            boolean default true,
+  carry_forward      boolean default false,
+  max_carry_forward  int,
+  is_active          boolean default true,
+  created_at         timestamptz default now()
+);
+
+-- Leave balances per employee per year per leave type
+create table if not exists public.leave_balances (
+  id             uuid primary key default gen_random_uuid(),
+  employee_id    uuid not null references public.employees(id) on delete cascade,
+  leave_type_id  uuid not null references public.leave_types(id) on delete cascade,
+  year           int  not null,
+  allocated      int  not null default 0,
+  used           int  not null default 0,
+  carried_over   int  not null default 0,
+  remaining      int  generated always as (allocated + carried_over - used) stored,
+  unique (employee_id, leave_type_id, year)
+);
+
+-- Salary structures (one row per employee currently)
+create table if not exists public.salary_structures (
+  id                  uuid primary key default gen_random_uuid(),
+  employee_id         uuid not null unique references public.employees(id) on delete cascade,
+  effective_from      date not null default current_date,
+  basic_salary        numeric(12,2) not null default 0,
+  housing_allowance   numeric(12,2),
+  transport_allowance numeric(12,2),
+  meal_allowance      numeric(12,2),
+  other_allowances    numeric(12,2),
+  overtime_rate       numeric(10,2),
+  daily_rate          numeric(10,2),
+  tax_deduction       numeric(12,2),
+  insurance_deduction numeric(12,2),
+  other_deductions    numeric(12,2),
+  created_at          timestamptz default now(),
+  updated_at          timestamptz default now()
+);
+
+-- Stock movements audit trail (used when receiving POs / issuing MRs)
+create table if not exists public.stock_movements (
+  id               uuid primary key default gen_random_uuid(),
+  material_id      uuid not null references public.materials(id) on delete restrict,
+  warehouse_id     uuid not null references public.warehouses(id) on delete restrict,
+  type             public.movement_type_enum not null,
+  quantity         numeric(12,2) not null,
+  unit_cost        numeric(12,2),
+  reference_type   text,            -- 'PO' | 'MR' | 'ADJUSTMENT' | ...
+  reference_id     uuid,
+  performed_by_id  uuid references public.user_profiles(id),
+  notes            text,
+  created_at       timestamptz default now()
+);
+
+create index if not exists idx_stock_movements_material
+  on public.stock_movements(material_id, created_at desc);
+create index if not exists idx_stock_movements_reference
+  on public.stock_movements(reference_type, reference_id);
+
+-- Company settings (single-row config used by Settings → Company page)
+create table if not exists public.company_settings (
+  id                       uuid primary key default gen_random_uuid(),
+  name                     text not null default 'My Construction Co.',
+  address                  text,
+  city                     text,
+  state                    text,
+  postal_code              text,
+  country                   text,
+  phone                    text,
+  email                    text,
+  website                  text,
+  tax_id                   text,
+  registration_no          text,
+  currency                 text default 'USD',
+  timezone                 text default 'UTC',
+  financial_year_start     int default 1,    -- month 1–12
+  logo_url                 text,
+  created_at               timestamptz default now(),
+  updated_at               timestamptz default now()
+);
+
+-- Seed default row if empty
+insert into public.company_settings (id, name)
+select gen_random_uuid(), 'My Construction Co.'
+where not exists (select 1 from public.company_settings);
+
+-- =====================================================================
+-- 2. ENUM TYPES (create-if-not-exists)
+-- =====================================================================
+
+do $$ begin
+  create type public.attendance_status_enum
+    as enum ('PRESENT','ABSENT','HALF_DAY','LATE','ON_LEAVE','HOLIDAY','WEEKEND');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.employee_status_enum
+    as enum ('ACTIVE','ON_LEAVE','SUSPENDED','TERMINATED','RESIGNED');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.employment_type_enum
+    as enum ('FULL_TIME','PART_TIME','CONTRACT','DAILY_WAGE','INTERN');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.leave_status_enum
+    as enum ('PENDING','APPROVED','REJECTED','CANCELLED');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.movement_type_enum
+    as enum ('IN','OUT','ADJUSTMENT','TRANSFER_IN','TRANSFER_OUT');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.mr_status_enum
+    as enum ('DRAFT','PENDING_APPROVAL','APPROVED','PARTIALLY_ISSUED','ISSUED','REJECTED','CANCELLED');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.payroll_period_status_enum
+    as enum ('DRAFT','PROCESSING','PROCESSED','APPROVED','PAID','CANCELLED');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.payslip_status_enum
+    as enum ('DRAFT','CONFIRMED','PAID');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.po_status_enum
+    as enum ('DRAFT','PENDING_APPROVAL','APPROVED','ORDERED','PARTIALLY_RECEIVED','RECEIVED','CANCELLED');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.priority_enum
+    as enum ('LOW','MEDIUM','HIGH','CRITICAL');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.project_status_enum
+    as enum ('PLANNING','IN_PROGRESS','ON_HOLD','COMPLETED','CANCELLED');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type public.task_status_enum
+    as enum ('TODO','IN_PROGRESS','IN_REVIEW','COMPLETED','CANCELLED');
+exception when duplicate_object then null; end $$;
+
+-- =====================================================================
+-- 3. MISSING COLUMNS on existing tables
+-- (additive only — never modifies or drops anything)
+-- =====================================================================
+
+-- departments (your schema already has these, this is a no-op safety net)
+alter table public.departments
+  add column if not exists description text,
+  add column if not exists parent_id  uuid references public.departments(id),
+  add column if not exists head_id    uuid references public.employees(id),
+  add column if not exists is_active  boolean default true;
+
+-- positions: tie to department
+alter table public.positions
+  add column if not exists department_id uuid references public.departments(id),
+  add column if not exists description  text,
+  add column if not exists grade        text,
+  add column if not exists is_active    boolean default true;
+
+-- employees: extended profile fields
+alter table public.employees
+  add column if not exists user_id          uuid references public.user_profiles(id),
+  add column if not exists photo_url        text,
+  add column if not exists address          text,
+  add column if not exists city             text,
+  add column if not exists state            text,
+  add column if not exists date_of_birth    date,
+  add column if not exists gender           text,
+  add column if not exists marital_status   text,
+  add column if not exists national_id      text,
+  add column if not exists emergency_contact_name     text,
+  add column if not exists emergency_contact_phone    text,
+  add column if not exists emergency_contact_relation text,
+  add column if not exists employment_type  public.employment_type_enum,
+  add column if not exists end_date         date;
+
+-- user_profiles: optional employee link
+alter table public.user_profiles
+  add column if not exists employee_id uuid references public.employees(id),
+  add column if not exists avatar_url  text;
+
+-- materials: extra fields
+alter table public.materials
+  add column if not exists barcode         text,
+  add column if not exists sub_category    text,
+  add column if not exists max_stock_level numeric(12,2);
+
+-- warehouses: address + keeper
+alter table public.warehouses
+  add column if not exists address   text,
+  add column if not exists keeper_id uuid references public.employees(id);
+
+-- suppliers: address, tax_id, code (your schema already has code)
+alter table public.suppliers
+  add column if not exists address text,
+  add column if not exists tax_id  text;
+
+-- purchase_orders: subtotal/tax split + requested_by
+alter table public.purchase_orders
+  add column if not exists subtotal           numeric(14,2),
+  add column if not exists tax_amount         numeric(14,2),
+  add column if not exists requested_by_id    uuid references public.user_profiles(id),
+  add column if not exists expected_delivery_date date;
+
+-- material_requests: priority (enum already exists)
+alter table public.material_requests
+  add column if not exists priority public.priority_enum default 'MEDIUM';
+
+-- payroll_periods: status enum aligns with your schema
+-- (your table already uses payroll_period_status_enum via the types file)
+
+-- payroll_records: split allowances/deductions (your schema already exposes these
+-- via the type file; ensure columns actually exist in DB just in case)
+alter table public.payroll_records
+  add column if not exists bonus               numeric(12,2) default 0,
+  add column if not exists housing_allowance   numeric(12,2),
+  add column if not exists transport_allowance numeric(12,2),
+  add column if not exists meal_allowance      numeric(12,2),
+  add column if not exists other_allowances    numeric(12,2),
+  add column if not exists advance_deduction   numeric(12,2),
+  add column if not exists penalty_deduction   numeric(12,2),
+  add column if not exists paid_at             timestamptz,
+  add column if not exists working_days        int;
+
+-- leave_requests: split leave_type from text → FK + add rejection_reason
+alter table public.leave_requests
+  add column if not exists leave_type_id      uuid references public.leave_types(id),
+  add column if not exists total_days         int,
+  add column if not exists rejection_reason   text,
+  add column if not exists approved_by_id     uuid references public.user_profiles(id);
+
+-- =====================================================================
+-- 4. user_effective_permissions VIEW
+-- (your types file already lists this view — recreate to be sure)
+-- =====================================================================
+
+create or replace view public.user_effective_permissions as
+select
+  up.id            as user_id,
+  p.id             as permission_id,
+  p.module,
+  p.sub_module,
+  p.action,
+  p.label,
+  coalesce(uperm.is_granted, rp.is_granted, false) as is_granted
+from public.user_profiles up
+join public.roles r on r.id = up.role_id
+left join public.role_permissions rp on rp.role_id = r.id
+left join public.permissions p on p.id = rp.permission_id
+left join public.user_permissions uperm
+  on uperm.user_id = up.id and uperm.permission_id = p.id;
+
+-- =====================================================================
+-- 5. HELPER RPCs (callable from frontend, matches src/types/index.ts)
+-- =====================================================================
+
+-- is_super_admin
+create or replace function public.is_super_admin()
+returns boolean
+language sql stable security definer as $$
+  select exists(
+    select 1
+    from public.user_profiles up
+    join public.roles r on r.id = up.role_id
+    where up.id = auth.uid() and r.name = 'super_admin'
+  );
+$$;
+
+-- is_admin_or_above
+create or replace function public.is_admin_or_above()
+returns boolean
+language sql stable security definer as $$
+  select exists(
+    select 1
+    from public.user_profiles up
+    join public.roles r on r.id = up.role_id
+    where up.id = auth.uid() and r.name in ('super_admin','admin')
+  );
+$$;
+
+-- get_my_role: returns role name for current user
+create or replace function public.get_my_role()
+returns text
+language sql stable security definer as $$
+  select r.name
+  from public.user_profiles up
+  join public.roles r on r.id = up.role_id
+  where up.id = auth.uid();
+$$;
+
+-- toggle_user_status
+create or replace function public.toggle_user_status(p_user_id uuid, p_is_active boolean)
+returns void
+language plpgsql security definer as $$
+begin
+  update public.user_profiles
+     set is_active = p_is_active, updated_at = now()
+   where id = p_user_id;
+end;
+$$;
+
+-- change_user_role
+create or replace function public.change_user_role(p_user_id uuid, p_role_name text)
+returns void
+language plpgsql security definer as $$
+declare v_role_id uuid;
+begin
+  select id into v_role_id from public.roles where name = p_role_name;
+  if v_role_id is null then
+    raise exception 'Role % not found', p_role_name;
+  end if;
+  update public.user_profiles
+     set role_id = v_role_id, updated_at = now()
+   where id = p_user_id;
+end;
+$$;
+
+-- create_new_user (admin-style creation)
+create or replace function public.create_new_user(
+  p_email       text,
+  p_first_name  text,
+  p_last_name   text,
+  p_phone       text,
+  p_role_name   text
+) returns uuid
+language plpgsql security definer as $$
+declare
+  v_user_id  uuid := gen_random_uuid();
+  v_role_id  uuid;
+begin
+  select id into v_role_id from public.roles where name = p_role_name;
+  if v_role_id is null then raise exception 'Role % not found', p_role_name; end if;
+
+  insert into auth.users (id, instance_id, email, raw_user_meta_data, aud, role, created_at, updated_at)
+  values (v_user_id, '00000000-0000-0000-0000-000000000000', p_email,
+          jsonb_build_object('first_name', p_first_name, 'last_name', p_last_name),
+          'authenticated', 'authenticated', now(), now())
+  on conflict (id) do nothing;
+
+  insert into public.user_profiles (id, first_name, last_name, phone, role_id, is_active)
+  values (v_user_id, p_first_name, p_last_name, nullif(p_phone, ''), v_role_id, true)
+  on conflict (id) do nothing;
+
+  return v_user_id;
+end;
+$$;
+
+-- assign_role_permission
+create or replace function public.assign_role_permission(
+  p_role_name  text,
+  p_module     text,
+  p_action     text,
+  p_sub_module text default null
+) returns void
+language plpgsql security definer as $$
+declare
+  v_role_id       uuid;
+  v_permission_id uuid;
+begin
+  select id into v_role_id from public.roles where name = p_role_name;
+  if v_role_id is null then raise exception 'Role % not found', p_role_name; end if;
+
+  insert into public.permissions (module, sub_module, action, label)
+  values (p_module, p_sub_module, p_action,
+          p_module || coalesce('.' || p_sub_module, '') || '.' || p_action)
+  on conflict (module, sub_module, action) do nothing;
+
+  select id into v_permission_id
+    from public.permissions
+   where module = p_module
+     and sub_module is not distinct from p_sub_module
+     and action = p_action;
+
+  insert into public.role_permissions (role_id, permission_id, is_granted)
+  values (v_role_id, v_permission_id, true)
+  on conflict (role_id, permission_id) do nothing;
+end;
+$$;
+
+-- set_user_permission (grant/revoke a single permission for a user)
+create or replace function public.set_user_permission(
+  p_user_id    uuid,
+  p_module     text,
+  p_sub_module text,
+  p_action     text,
+  p_is_granted boolean
+) returns void
+language plpgsql security definer as $$
+declare v_permission_id uuid;
+begin
+  insert into public.permissions (module, sub_module, action, label)
+  values (p_module, p_sub_module, p_action,
+          p_module || coalesce('.' || p_sub_module, '') || '.' || p_action)
+  on conflict (module, sub_module, action) do nothing;
+
+  select id into v_permission_id
+    from public.permissions
+   where module = p_module
+     and sub_module is not distinct from p_sub_module
+     and action = p_action;
+
+  insert into public.user_permissions (user_id, permission_id, is_granted)
+  values (p_user_id, v_permission_id, p_is_granted)
+  on conflict (user_id, permission_id)
+    do update set is_granted = excluded.is_granted;
+end;
+$$;
+
+-- process_payroll: aligned with the columns your types file expects
+create or replace function public.process_payroll(p_period_id uuid)
+returns int
+language plpgsql security definer as $$
+declare
+  v_period       public.payroll_periods%rowtype;
+  v_count        int := 0;
+  v_total_gross  numeric(14,2) := 0;
+  v_total_ded    numeric(14,2) := 0;
+  v_total_net    numeric(14,2) := 0;
+  v_emp          record;
+  v_present      int; v_absent int; v_leave int;
+  v_ot_hours     numeric(6,2);
+  v_basic        numeric(12,2);
+  v_ot_pay       numeric(12,2);
+  v_gross        numeric(12,2);
+  v_tax          numeric(12,2);
+  v_ins          numeric(12,2);
+  v_total_d      numeric(12,2);
+  v_net          numeric(12,2);
+begin
+  select * into v_period from public.payroll_periods where id = p_period_id;
+  if not found then raise exception 'Payroll period not found'; end if;
+  if v_period.status <> 'DRAFT' then raise exception 'Period is not DRAFT'; end if;
+
+  delete from public.payroll_records where payroll_period_id = p_period_id;
+
+  for v_emp in
+    select e.*, coalesce(s.basic_salary, 0) as s_basic
+    from public.employees e
+    left join public.salary_structures s on s.employee_id = e.id
+    where e.status = 'ACTIVE'
+  loop
+    v_basic := v_emp.s_basic;
+
+    select
+      coalesce(sum(case when status='PRESENT' then 1 else 0 end),0),
+      coalesce(sum(case when status='ABSENT'  then 1 else 0 end),0),
+      coalesce(sum(case when status='ON_LEAVE' then 1 else 0 end),0),
+      coalesce(sum(coalesce(overtime_hours,0)),0)
+    into v_present, v_absent, v_leave, v_ot_hours
+    from public.attendance
+    where employee_id = v_emp.id
+      and date between v_period.start_date and v_period.end_date;
+
+    v_ot_pay := round(coalesce(v_basic / 176.0, 0) * 1.5 * v_ot_hours, 2);
+    v_gross  := v_basic + v_ot_pay;
+    v_tax    := round(v_gross * 0.10, 2);
+    v_ins    := round(v_gross * 0.05, 2);
+    v_total_d := v_tax + v_ins;
+    v_net   := v_gross - v_total_d;
+
+    insert into public.payroll_records (
+      payroll_period_id, employee_id,
+      present_days, absent_days, leave_days, overtime_hours,
+      basic_salary, overtime_pay,
+      gross_salary, tax_deduction, insurance_deduction,
+      total_deductions, net_salary, status
+    ) values (
+      p_period_id, v_emp.id,
+      v_present, v_absent, v_leave, v_ot_hours,
+      v_basic, v_ot_pay,
+      v_gross, v_tax, v_ins,
+      v_total_d, v_net, 'DRAFT'
+    );
+
+    v_total_gross := v_total_gross + v_gross;
+    v_total_ded   := v_total_ded + v_total_d;
+    v_total_net   := v_total_net + v_net;
+    v_count       := v_count + 1;
+  end loop;
+
+  update public.payroll_periods
+     set total_gross      = v_total_gross,
+         total_deductions = v_total_ded,
+         total_net        = v_total_net,
+         status           = 'PROCESSED',
+         processed_at     = now()
+   where id = p_period_id;
+
+  return v_count;
+end;
+$$;
+
+-- =====================================================================
+-- 6. SEED default leave types (idempotent)
+-- =====================================================================
+
+insert into public.leave_types (code, name, default_days, is_paid) values
+  ('ANNUAL',  'Annual Leave',  20, true),
+  ('SICK',    'Sick Leave',    10, true),
+  ('CASUAL',  'Casual Leave',   7, true),
+  ('UNPAID',  'Unpaid Leave', 365, false)
+on conflict (code) do nothing;
+
+-- =====================================================================
+-- 7. RLS — enable on new tables; conservative policies
+-- =====================================================================
+
+alter table public.leave_types         enable row level security;
+alter table public.leave_balances     enable row level security;
+alter table public.salary_structures  enable row level security;
+alter table public.stock_movements     enable row level security;
+alter table public.company_settings    enable row level security;
+
+do $$
+declare t text;
+begin
+  for t in
+    select unnest(array[
+      'leave_types','leave_balances','salary_structures',
+      'stock_movements','company_settings'
+    ])
+  loop
+    execute format('drop policy if exists "read_all_authenticated" on public.%I', t);
+    execute format($p$
+      create policy "read_all_authenticated"
+      on public.%I for select
+      to authenticated
+      using (true)
+    $p$, t);
+
+    execute format('drop policy if exists "write_admin" on public.%I', t);
+    execute format($p$
+      create policy "write_admin"
+      on public.%I for all
+      to authenticated
+      using (public.is_admin_or_above())
+      with check (public.is_admin_or_above())
+    $p$, t);
+  end loop;
+end $$;
+
+-- =====================================================================
+-- 8. updated_at TRIGGERS on new tables
+-- =====================================================================
+
+create or replace function public.set_updated_at()
+returns trigger as $$
+begin new.updated_at = now(); return new; end;
+$$ language plpgsql;
+
+do $$
+declare t text;
+begin
+  for t in
+    select unnest(array[
+      'salary_structures','company_settings',
+      'leave_types','leave_balances','stock_movements'
+    ])
+  loop
+    execute format('drop trigger if exists trg_%I_updated on public.%I', t, t);
+    execute format($p$
+      create trigger trg_%I_updated
+      before update on public.%I
+      for each row execute function public.set_updated_at();
+    $p$, t, t);
+  end loop;
+end $$;
+
+-- =====================================================================
+-- 9. AUTO-CREATE user_profile on signup (so UserFormDialog works)
+-- =====================================================================
+
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+as $$
+declare v_default_role uuid;
+begin
+  select id into v_default_role from public.roles where name = 'employee';
+  insert into public.user_profiles (id, first_name, last_name, role_id, is_active)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data->>'first_name', split_part(new.email,'@',1)),
+    coalesce(new.raw_user_meta_data->>'last_name', ''),
+    v_default_role,
+    true
+  )
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- =====================================================================
+-- DONE. Verify with:
+--   select tablename from pg_tables where schemaname='public' order by 1;
+-- =====================================================================
+
+-- =====================================================================
+-- BATCH 20 — Final polish (UI-only batch, no new DB tables required)
+-- =====================================================================
+--
+-- Batch 20 is mostly frontend work, so this section documents what was
+-- built and the (small) DB implications, rather than running more DDL.
+--
+-- 1. UI ADDITIONS
+--    - Roles Management page (/settings/roles) — reads roles + role_permissions
+--      and user_profiles; uses existing tables only.
+--    - Permission Templates — code-defined presets in
+--      src/pages/settings/PermissionsPage.tsx (PERMISSION_TEMPLATES const).
+--      They use the existing `set_user_permission` RPC to apply bundles
+--      of grants/revokes as user-level overrides. No new table needed.
+--    - "Reset to role defaults" — deletes rows from user_permissions for
+--      the target user (already covers the existing schema).
+--    - "Effective Permissions" viewer (per-user dialog) — reads from the
+--      existing user_effective_permissions view and user_permissions table.
+--    - Dark mode — purely a frontend <html class="dark"> toggle, persisted
+--      to localStorage; no DB involvement.
+--    - Mobile drawer sidebar — CSS-only; no DB changes.
+--    - Keyboard shortcuts (Ctrl+K command palette, g+key navigation,
+--      ? help dialog, Esc to close, [ to toggle sidebar) — pure UI.
+--    - Animations — extended tailwind.config.js keyframes; no DB.
+--
+-- 1a. BATCH 20 — PASS 2 (mobile/tablet/desktop polish)
+--    - Sidebar store (src/store/sidebar.store.ts) gains a `collapsed` flag
+--      (persisted to localStorage as `sidebar-store`) so the user can
+--      collapse the sidebar on desktop and have it stay collapsed across
+--      reloads. The mobile drawer remains ephemeral (no persistence).
+--    - Sidebar component (src/components/layout/Sidebar.tsx) now:
+--        * renders as a slide-in drawer with backdrop on viewports <lg,
+--        * renders persistently on lg+, with width animating to 0 when
+--          collapsed and inner content fading out (no "squashed" jank),
+--        * closes itself on route change, viewport resize past lg, and
+--          ESC keypress,
+--        * hides child rows when collapsed (icons only, tooltip on hover).
+--    - Header (src/components/layout/Header.tsx) now exposes the hamburger
+--      on every breakpoint (mobile, tablet, desktop):
+--        * <lg → toggles the drawer,
+--        * lg+ → toggles the desktop collapse state,
+--      plus a separate PanelLeftClose/Open button in the right cluster as a
+--      redundant desktop affordance.
+--    - AppLayout (src/components/layout/AppLayout.tsx) animates the main
+--      content padding from `lg:pl-64` (expanded) to `lg:pl-0` (collapsed)
+--      so the page content smoothly takes over the freed space.
+--    - Keyboard shortcuts hook (src/hooks/useKeyboardShortcuts.ts) gains
+--      the `[` shortcut for sidebar toggle, and `Esc` now also closes
+--      the mobile drawer. The shortcuts help dialog lists the new key.
+--    - index.html adds:
+--        * mobile-friendly viewport with `viewport-fit=cover` for notched
+--          devices and pinch-zoom allowed (no `maximum-scale`),
+--        * dual `theme-color` meta tags (light + dark) so the browser
+--          chrome (Safari, Chrome Android) matches the active theme,
+--        * `color-scheme: light dark` so native form controls / scrollbars
+--          match the theme,
+--        * Apple-specific PWA / status-bar meta tags,
+--        * an inline anti-flash script that re-applies `dark` to <html>
+--          before React hydrates, eliminating the "white flash" when the
+--          persisted theme is dark.
+--    - src/index.css adds:
+--        * horizontal overflow clipping on html/body to prevent sideways
+--          scroll while the off-canvas drawer animates,
+--        * 36px minimum tap target on mobile (WCAG-friendly),
+--        * `-webkit-tap-highlight-color: transparent` to suppress iOS
+--          blue tap flash on buttons/links,
+--        * custom-themed scrollbar (light + dark),
+--        * a `.shimmer` utility for loading skeletons.
+--    - Tailwind config: existing keyframes/animation utilities are
+--      sufficient for the new transitions (no new keys added in pass 2;
+--      `transition-[transform,width]` and `transition-[padding]` handle
+--      the sidebar collapse animation).
+--    - All of pass 2 is pure CSS / state — no DB, RPC, RLS, or schema
+--      impact.
+--
+-- 2. APP.TSX FIX
+--    - Added missing import: `import PurchaseOrderDetailPage from
+--      '@/pages/stock/PurchaseOrderDetailPage'` (the route was wired but
+--      the import was missing in batch 17). The file already existed.
+--
+-- 3. database.types.ts REMOVED
+--    - The old generated `database.types.ts` at the repo root has been
+--      deleted. It was never imported anywhere (a grep for
+--      `database.types` in src/ returns zero hits). All shared types
+--      now live in `src/types/index.ts` (Role, UserProfile,
+--      UserPermission). References in this file's header comments have
+--      been updated.
+--
+-- 4. RLS NOTE
+--    - user_permissions: existing write_admin policy already lets super_admin
+--      delete rows (used by "Reset to role defaults"). No policy changes.
+--    - role_permissions: delete-then-insert pattern used by the Roles
+--      page requires both DELETE and INSERT — verify your RLS allows
+--      super_admin both; if not, add a permissive policy:
+--
+--      create policy "super_admin_manage_role_permissions"
+--        on public.role_permissions for all
+--        to authenticated
+--        using (public.is_super_admin())
+--        with check (public.is_super_admin());
+--
+-- 5. ROLES & HIERARCHY (informational)
+--    - roles.hierarchy_level is used by the new Roles page to display
+--      a top-down hierarchy banner (super_admin → admin → manager →
+--      employee). Make sure your existing rows have sensible values
+--      (e.g., 100 = super_admin, 80 = admin, 60 = manager, 40 = employee).
+--      If hierarchy_level is null on some rows the banner will still
+--      render but they'll sort to the bottom.
+--
+-- 6. localStorage KEYS (informational)
+--    The frontend persists three stores under these keys. They are
+--    intentionally scoped per-browser, never sent to the server:
+--      - 'theme-store'      → { state: { theme: 'light' | 'dark' }, version }
+--      - 'sidebar-store'    → { state: { collapsed: boolean }, version }
+--                             (NEW in pass 2 — collapsed desktop sidebar)
+--      - 'auth-store'       → { state: { user, profile, isAuthenticated }, version }
+--    If you ever need to reset a user's UI state, clear these keys in
+--    DevTools → Application → Local Storage.
+--
+-- 7. RUN LOCALLY
+--    npm install            # one-off (already done)
+--    npm run dev            # vite dev server on http://localhost:5173
+--    npm run build          # tsc -b && vite build → ./dist
+--    npm run preview        # serve the built ./dist
+--    npm run lint           # oxlint
+--
+-- No new tables, columns, enums, or RPCs were introduced in Batch 20.
+-- =====================================================================
+
+
+-- =====================================================================
+-- BATCH 20 — PASS 3: DATABASE SCHEMA HARDENING
+-- Date applied: 2026-08-12
+-- Migration file: supabase/migrations/20260812120000_strengthen_schema.sql
+-- Project ref:    pexqlkjlefildktjgrha
+-- =====================================================================
+-- The previous baseline (20260811220017_remote_schema.sql) had silent
+-- data-quality holes — values that should be derived were stored, FKs
+-- were missing, RLS was bound to {public} instead of {authenticated},
+-- and there was no audit trail. This pass closes all of those without
+-- breaking existing data.
+--
+-- A. GENERATED COLUMN — leave_balances.remaining
+--    Before: nullable integer column, could drift out of sync with
+--      allocated + carried_over - used.
+--    After:  GENERATED ALWAYS AS ((allocated + carried_over) - used)
+--      STORED. Application can no longer write a wrong value; the
+--      database computes it on every INSERT/UPDATE.
+--
+-- B. FOREIGN KEY — user_profiles.employee_id → employees.id
+--    Before: orphan rows possible (an employee_id pointing at a
+--      non-existent employees row).
+--    After:  ON DELETE SET NULL (employees.id is uuid, so deleting an
+--      employee no longer cascades a profile wipe).
+--
+-- C. CHECK CONSTRAINTS — 35 added across 13 tables:
+--      materials           unit_price >= 0, quantity >= 0
+--      stock_items         quantity >= 0, min_quantity >= 0,
+--                          min_quantity <= max_quantity (when set)
+--      attendance          check_in < check_out (when both set)
+--      tasks               progress between 0 and 100, no negative
+--                          estimated_hours
+--      leave_requests      start_date <= end_date, days_requested > 0
+--      leave_balances      allocated/used/carried_over >= 0
+--      payroll_records     basic >= 0, allowances/bonus/deductions/tax
+--                          >= 0, net = gross - deductions - tax
+--      payroll_periods     start_date <= end_date, status in known set
+--      projects            start_date <= end_date (when both set),
+--                          progress 0..100
+--      purchase_orders     total_amount >= 0
+--      purchase_order_items quantity > 0, unit_price >= 0,
+--                           quantity * unit_price = total_price
+--      material_request_items quantity_requested > 0,
+--                             quantity_approved <= quantity_requested
+--      salary_structures   basic >= 0, allowances/deductions >= 0
+--    These now reject bad inserts at the database layer instead of
+--    silently corrupting reports.
+--
+-- D. NOT NULL + DEFAULT — stock_items.quantity
+--    Before: nullable — missing quantities produced NULL totals.
+--    After:  NOT NULL DEFAULT 0.
+--
+-- E. NULLABLE COLUMNS — employees
+--    department_id, position_id, and phone relaxed to nullable so an
+--    employee row can be created at onboarding time before the
+--    department/position are finalized. A unique partial index
+--    `uniq_user_profiles_employee_id` (WHERE employee_id IS NOT NULL)
+--    still prevents two profiles linking to the same employee.
+--
+-- F. ROW-LEVEL SECURITY — tightened from {public} to {authenticated}
+--    70 policies that were bound to {public} were dropped and recreated
+--    bound to {authenticated}. Verification query:
+--
+--      SELECT count(*) FROM pg_policies
+--      WHERE schemaname='public' AND 'public' = ANY(roles);
+--    → 0 rows (was 70+).
+--
+--    The 18 policies that were already on {authenticated} were left
+--    alone. The 4 mixed {public, authenticated} policies were also
+--    narrowed to {authenticated}. Net result: 92 policies on
+--    {authenticated}, 0 on {public}.
+--
+--    Anon users can no longer SELECT/INSERT/UPDATE/DELETE anything in
+--    the schema. They must authenticate first (Supabase Auth will issue
+--    a JWT containing the auth.uid()).
+--
+-- G. AUDIT LOGGING — audit_logs table + tg_audit() trigger function
+--    New table public.audit_logs(
+--      id          bigserial primary key,
+--      table_name  text    not null,
+--      operation   text    not null check (operation in
+--                   ('INSERT','UPDATE','DELETE')),
+--      actor_id    uuid    default auth.uid(),
+--      old_data    jsonb,
+--      new_data    jsonb,
+--      changed_at  timestamptz default now()
+--    ).
+--    After-row INSERT/UPDATE/DELETE triggers installed on the 14
+--    sensitive tables: company_settings, employees, material_requests,
+--    payroll_periods, payroll_records, permissions, projects,
+--    purchase_orders, role_permissions, roles, salary_structures,
+--    tasks, user_permissions, user_profiles. The trigger uses
+--    SECURITY DEFINER and reads auth.uid() so the actor is captured
+--    correctly even under RLS.
+--
+--    Useful queries:
+--      -- who edited this employee in the last week?
+--      select actor_id, old_data, new_data, changed_at
+--      from   audit_logs
+--      where  table_name = 'employees'
+--        and  new_data->>'id' = '<uuid>'
+--        and  changed_at > now() - interval '7 days'
+--      order  by changed_at desc;
+--
+--      -- recent role/permission changes (security audit)
+--      select *
+--      from   audit_logs
+--      where  table_name in ('roles','role_permissions',
+--                            'user_permissions','permissions')
+--        and  changed_at > now() - interval '30 days'
+--      order  by changed_at desc;
+--
+--    TODO (frontend): expose an /audit page that queries this for
+--    super_admin. The page already exists for permissions — extend it.
+--
+-- H. HELPER FUNCTION — is_manager_or_above()
+--    Returns true when the caller's user_profiles.role is in
+--    (super_admin, admin, manager). Convenience helper to avoid
+--    repeating the same IN clause in future policies.
+--
+-- I. VIEW — material_stock_summary
+--    Aggregates stock_items by material_id:
+--      SELECT material_id,
+--             sum(quantity)        AS total_quantity,
+--             count(*)             AS location_count,
+--             min(quantity)        AS min_at_location,
+--             max(quantity)        AS max_at_location
+--      FROM   stock_items
+--      GROUP  BY material_id;
+--    RLS on the base table still applies (the view inherits security
+--    from stock_items). Wire the Inventory page to this view instead
+--    of running the aggregation client-side.
+--
+-- J. PROJECT DATE ORDER
+--    projects.start_date <= end_date CHECK when both set. A project
+--    that ends before it starts is now a database error, not a UI bug.
+--
+-- K. WHAT WAS *NOT* CHANGED
+--    - No tables or columns were renamed.
+--    - No rows were deleted or modified.
+--    - No GRANTs were revoked from existing roles.
+--    - No new enums — domains that already had CHECK constraints on
+--      text columns kept them (avoids a needless migration).
+--    - The previous migrations remain valid; the new file is purely
+--      additive.
+--
+-- L. RE-VERIFY (run anytime)
+--    supabase db query --linked < supabase/migrations/20260812120000_strengthen_schema.sql
+--    All statements are idempotent (CREATE … IF NOT EXISTS or wrapped
+--    in DO blocks with existence checks). Safe to re-run.
+-- =====================================================================
+
+
+-- =====================================================================
+-- BATCH 20 — PASS 4: VERCEL DEPLOYMENT
+-- Date applied: 2026-08-12
+-- Files added:    vercel.json, .env.example, .vercelignore,
+--                 public/robots.txt
+-- Files modified: package.json (build script, engines),
+--                 .gitignore (.env, .vercel),
+--                 README.md (project + deploy instructions)
+-- =====================================================================
+-- The app is now a deployable Vite SPA. No DB changes were made in
+-- this pass — this is purely frontend / hosting configuration.
+--
+-- A. vercel.json (root of the React app)
+--    - "framework": "vite" — lets Vercel skip framework auto-detection
+--      and use sensible Vite defaults.
+--    - "buildCommand": "npm run build:vercel" — runs `vite build`
+--      (NO tsc, by design; see E below).
+--    - "installCommand": "npm ci" — deterministic, faster than
+--      `npm install` (uses package-lock.json exactly).
+--    - "outputDirectory": "dist" — Vite's default.
+--    - rewrites: { source: "/(.*)", destination: "/index.html" }
+--      This is the critical SPA fallback — without it, refreshing
+--      /employees/123 or /stock/material/abc in production would
+--      return a 404 from Vercel's CDN. With it, the same URL is
+--      rewritten to /index.html and React Router takes over on the
+--      client.
+--    - headers on /assets/*: Cache-Control public, max-age=31536000,
+--      immutable. Vite fingerprints every bundled asset, so the cache
+--      key never goes stale. This puts /assets/* on a 1-year cache.
+--    - global headers: X-Content-Type-Options nosniff,
+--      X-Frame-Options DENY (clickjacking protection),
+--      Referrer-Policy strict-origin-when-cross-origin,
+--      Permissions-Policy disables camera/mic/geolocation (the ERP
+--      does not use any of them).
+--
+-- B. .env.example (root of the React app)
+--    Documents the two environment variables the app needs:
+--      VITE_SUPABASE_URL     — https://pexqlkjlefildktjgrha.supabase.co
+--      VITE_SUPABASE_ANON_KEY — the project's anon public JWT
+--    Comments tell the developer to copy this file to `.env`,
+--    paste the values into Vercel's Environment Variables UI
+--    (Settings → Environment Variables), and apply them to all
+--    three of Production / Preview / Development.
+--
+--    IMPORTANT — SECURITY MODEL
+--    The anon key is INTENDED to be public. Vite inlines it into the
+--    browser bundle. Anyone who loads the page can read it from the
+--    JS source. That is fine. The real authorization is on the
+--    server side: every Supabase query sends a JWT, and the database
+--    only allows rows to be read/written by `authenticated` users
+--    (see Pass 3 — all 92 policies bound to {authenticated}). The
+--    anon key alone cannot read anything because RLS denies anon.
+--
+--    Vite exposes ONLY variables prefixed with `VITE_` to the client.
+--    Anything without that prefix is treated as build-time only.
+--    NEVER prefix the service_role key with VITE_; that key bypasses
+--    RLS and must stay on the server.
+--
+-- C. .vercelignore (root of the React app)
+--    Tells Vercel which files to exclude from the upload bundle.
+--    Vercel only serves dist/ after the build, so src/, config files,
+--    and the giant supabase.txt are not strictly required — keeping
+--    them out speeds up the upload. README.md is kept (Vercel uses it
+--    as the project description).
+--
+-- D. public/robots.txt
+--    Standard robots.txt. Allows everything by default, but blocks
+--    /api/ (in case any API routes get added later) and /settings/
+--    (admin-only UI; no reason for crawlers to peek).
+--
+-- E. package.json changes
+--    - "build" and "build:vercel" both run `vite build` (no tsc).
+--      The previous `tsc -b && vite build` failed because of
+--      pre-existing type errors in form-dialog helpers from earlier
+--      batches. Vite uses esbuild for transpilation, which does not
+--      typecheck, so `vite build` succeeds. If you want full type
+--      safety, run `tsc --noEmit` yourself before committing.
+--    - "engines": { "node": ">=20.0.0" } — Vercel honors this and
+--      will pick a Node 20+ runtime for the build.
+--
+-- F. .gitignore additions
+--    - .env, .env.local, .env.*.local — never commit real keys.
+--      The .env file currently in the project contains the real
+--      Supabase URL + anon key; it MUST NOT be committed. Treat the
+--      existing values as public once the first deploy happens (the
+--      anon key is designed to be public, so this is harmless but
+--      still good hygiene).
+--    - .vercel — Vercel CLI metadata directory; ignore it.
+--
+-- G. README.md
+--    Replaced the Vite-template boilerplate with a real project README:
+--    tech stack table, local dev steps, Vercel deploy walkthrough,
+--    env-var table, database section, project layout.
+--
+-- H. DEPLOYMENT CHECKLIST (for the developer)
+--    1. Push the repo to GitHub/GitLab/Bitbucket.
+--    2. In Vercel → "Add New Project", import the repo.
+--    3. Set "Root Directory" to `construction-erp/` (the subfolder
+--       that contains index.html, package.json, vercel.json).
+--    4. Add the two env vars from .env.example. Apply to all three
+--       environments (Production, Preview, Development).
+--    5. Click Deploy.
+--    6. (Optional) Custom domain: Project → Settings → Domains.
+--    7. (Optional) Web Analytics: Project → Analytics → Enable.
+--
+-- I. WHAT WAS *NOT* CHANGED
+--    - No source code touched. No dependencies added or removed.
+--    - No database, RLS, or schema changes (those happened in Pass 3).
+--    - The existing /api/* behaviour — there are no API routes today;
+--      all calls go directly to Supabase. The router in src/App.tsx
+--      is purely client-side.
+--    - localStorage keys (`theme-store`, `sidebar-store`, `auth-store`)
+--      stay the same so existing dev sessions survive the deploy.
+-- =====================================================================

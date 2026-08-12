@@ -1,0 +1,9 @@
+# Construction ERP — robots.txt
+# Allow all well-behaved crawlers. Authenticated pages live behind
+# the JavaScript app shell, so there's no risk of indexing protected
+# content from the static HTML alone.
+
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /settings/
