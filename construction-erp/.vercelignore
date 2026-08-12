@@ -1,28 +1,6 @@
-# Files Vercel doesn't need in the deployment bundle.
-# Vercel only ships `dist/` after `vite build` runs, so anything in
-# here just slops up the upload — keep the bundle small.
-
-# Source code is never deployed (Vite emits compiled JS into dist/).
-src/
-
-# Non-public assets that aren't referenced from index.html.
-public/icons.svg
-
-# The big developer notes file.
-supabase.txt
-
-# All Markdown besides README.md (Vercel reads README for project info).
-*.md
-!README.md
-
-# Misc dev artifacts
-.oxlintrc.json
-components.json
-postcss.config.js
-tailwind.config.js
-tsconfig*.json
-tsconfig*.tsbuildinfo
-.gitignore
-.env.example
-.vercelignore
-vercel.json
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+.vercel
