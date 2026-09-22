@@ -10,7 +10,6 @@ import { supabase } from '@/lib/supabase'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
 import {
   Dialog,
   DialogContent,
@@ -21,12 +20,11 @@ import {
 } from '@/components/ui/dialog'
 
 const warehouseSchema = z.object({
-  code: z.string().min(2, 'Code required'),
+  code: z.string().min(2, 'Warehouse code required'),
   name: z.string().min(2, 'Name required'),
   address: z.string().optional(),
   city: z.string().optional(),
-  manager_id: z.string().optional(),
-  capacity: z.coerce.number().min(0).optional(),
+  capacity: z.string().optional(),
   is_active: z.boolean(),
 })
 
@@ -62,8 +60,7 @@ export function WarehouseFormDialog({
       name: '',
       address: '',
       city: '',
-      manager_id: '',
-      capacity: 0,
+      capacity: '',
       is_active: true,
     },
   })
@@ -78,8 +75,7 @@ export function WarehouseFormDialog({
           name: '',
           address: '',
           city: '',
-          manager_id: '',
-          capacity: 0,
+          capacity: '',
           is_active: true,
         })
       }
@@ -101,13 +97,12 @@ export function WarehouseFormDialog({
           name: data.name,
           address: data.address || '',
           city: data.city || '',
-          manager_id: data.manager_id || '',
-          capacity: data.capacity ?? 0,
-          is_active: data.is_active,
+          capacity: '',
+          is_active: data.is_active ?? true,
         })
       }
     } catch (error: any) {
-      toast.error('Failed to load warehouse')
+      toast.error('Failed to load warehouse data')
     } finally {
       setLoadingData(false)
     }
@@ -116,11 +111,13 @@ export function WarehouseFormDialog({
   const onSubmit = async (data: WarehouseFormData) => {
     setLoading(true)
     try {
+      // Exclude 'capacity' so Supabase doesn't throw a schema error
+      const { capacity, ...restData } = data
+
       const payload = {
-        ...data,
+        ...restData,
         address: data.address || null,
         city: data.city || null,
-        manager_id: data.manager_id || null,
       }
 
       if (warehouseId) {
@@ -129,12 +126,13 @@ export function WarehouseFormDialog({
           .update(payload)
           .eq('id', warehouseId)
         if (error) throw error
-        toast.success('Warehouse updated')
+        toast.success('Warehouse updated successfully')
       } else {
         const { error } = await supabase.from('warehouses').insert(payload)
         if (error) throw error
-        toast.success('Warehouse created')
+        toast.success('Warehouse created successfully')
       }
+
       onSuccess()
       onOpenChange(false)
     } catch (error: any) {
@@ -146,12 +144,12 @@ export function WarehouseFormDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-xl">
+      <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>{warehouseId ? 'Edit Warehouse' : 'Add Warehouse'}</DialogTitle>
           <DialogDescription>
             {warehouseId
-              ? 'Update warehouse details below'
+              ? 'Update warehouse location information'
               : 'Add a new warehouse location'}
           </DialogDescription>
         </DialogHeader>
@@ -169,13 +167,14 @@ export function WarehouseFormDialog({
                   id="code"
                   placeholder="WH-001"
                   {...register('code')}
-                  disabled={!!warehouseId}
                   className={errors.code ? 'border-red-500' : ''}
+                  disabled={!!warehouseId}
                 />
                 {errors.code && (
                   <p className="text-xs text-red-500 mt-1">{errors.code.message}</p>
                 )}
               </div>
+
               <div>
                 <Label htmlFor="name">Name *</Label>
                 <Input
@@ -187,33 +186,33 @@ export function WarehouseFormDialog({
                   <p className="text-xs text-red-500 mt-1">{errors.name.message}</p>
                 )}
               </div>
+
               <div className="md:col-span-2">
                 <Label htmlFor="address">Address</Label>
                 <Input id="address" {...register('address')} />
               </div>
+
               <div>
                 <Label htmlFor="city">City</Label>
                 <Input id="city" {...register('city')} />
               </div>
+
               <div>
                 <Label htmlFor="capacity">Capacity</Label>
-                <Input
-                  id="capacity"
-                  type="number"
-                  step="0.01"
-                  {...register('capacity')}
-                />
+                <Input id="capacity" {...register('capacity')} />
               </div>
-              <div className="md:col-span-2">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={watch('is_active')}
-                    onChange={(e) => setValue('is_active', e.target.checked)}
-                    className="w-4 h-4 rounded border-slate-300"
-                  />
-                  <span className="text-sm font-medium">Active</span>
-                </label>
+
+              <div className="md:col-span-2 flex items-center gap-2 pt-2">
+                <input
+                  type="checkbox"
+                  id="is_active"
+                  checked={watch('is_active')}
+                  onChange={(e) => setValue('is_active', e.target.checked)}
+                  className="w-4 h-4 rounded border-slate-300"
+                />
+                <Label htmlFor="is_active" className="cursor-pointer font-medium">
+                  Active
+                </Label>
               </div>
             </div>
 

@@ -168,7 +168,7 @@ export function PurchaseOrderFormDialog({
       if (poError) throw poError
 
       const poItems = data.items.map(item => ({
-        purchase_order_id: po.id,
+        po_id: po.id,
         material_id: item.material_id,
         quantity: item.quantity,
         unit_price: item.unit_price,

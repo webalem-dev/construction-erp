@@ -132,15 +132,17 @@ export function SupplierFormDialog({
   const onSubmit = async (data: SupplierFormData) => {
     setLoading(true)
     try {
+      // Exclude 'notes' so Supabase doesn't throw a schema error
+      const { notes, ...restData } = data
+
       const payload = {
-        ...data,
+        ...restData,
         email: data.email || null,
         contact_person: data.contact_person || null,
         phone: data.phone || null,
         address: data.address || null,
         city: data.city || null,
         payment_terms: data.payment_terms || null,
-        notes: data.notes || null,
         rating: data.rating ?? null,
       }
 

@@ -129,17 +129,21 @@ export function MaterialRequestFormDialog({
   const onSubmit = async (data: RequestFormData) => {
     setLoading(true)
     try {
-      const { data: user } = await supabase.auth.getUser()
+      const { data: userData } = await supabase.auth.getUser()
+
+      // Generate a fallback MR number if DB doesn't auto-generate it
+      const generatedMrNumber = `MR-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`
 
       // Create the material request header
       const { data: mr, error: mrError } = await supabase
         .from('material_requests')
         .insert({
+          mr_number: generatedMrNumber,
           project_id: data.project_id,
           priority: data.priority,
           required_date: data.required_date,
           notes: data.notes || null,
-          requested_by_id: user.user?.id,
+          requested_by_id: userData?.user?.id || null,
           status: 'PENDING_APPROVAL',
         })
         .select()
@@ -148,10 +152,11 @@ export function MaterialRequestFormDialog({
       if (mrError) throw mrError
 
       // Insert line items
+           // Insert line items
       const items = data.items.map(item => ({
         material_request_id: mr.id,
         material_id: item.material_id,
-        requested_quantity: item.requested_quantity,
+        requested_qty: Number(item.requested_quantity), // <--- FIXED: Now matches your DB column exactly!
         notes: item.notes || null,
       }))
 

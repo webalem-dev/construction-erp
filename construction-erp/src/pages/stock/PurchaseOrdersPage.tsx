@@ -70,7 +70,7 @@ export default function PurchaseOrdersPage() {
           *,
           supplier:suppliers (id, name, code),
           project:projects (id, name),
-          items:purchase_order_items (id)
+          items:purchase_order_items!po_id (id)
         `)
         .order('created_at', { ascending: false })
 

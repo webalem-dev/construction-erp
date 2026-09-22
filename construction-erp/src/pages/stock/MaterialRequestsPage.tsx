@@ -70,7 +70,7 @@ export default function MaterialRequestsPage() {
           *,
           project:projects (id, name),
           requested_by:user_profiles!requested_by_id (first_name, last_name),
-          items:material_request_items (id)
+          items:material_request_items!material_request_id (id)
         `)
         .order('created_at', { ascending: false })
 
